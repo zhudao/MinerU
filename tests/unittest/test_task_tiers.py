@@ -95,19 +95,30 @@ def _request_body(inputs: list[tuple[str, bytes]], options: dict[str, Any]) -> d
     return {"files": [{"file_name": name, "bytes": len(data)} for name, data in inputs], **options}
 
 
-async def _complete(client: httpx.AsyncClient, task: dict[str, Any], inputs: list[tuple[str, bytes]]) -> dict[str, Any]:
+async def _complete(
+    client: httpx.AsyncClient,
+    task: dict[str, Any],
+    inputs: list[tuple[str, bytes]],
+    *,
+    timeout_seconds: float = 20,
+) -> dict[str, Any]:
     """上传真实源文件并等待终态，执行和结果获取均经过公共接口。"""
     for item, (_name, data) in zip(task["files"], inputs):
         response = await client.put(item["upload"]["url"], content=data, headers=item["upload"]["headers"])
         assert response.status_code == 200, response.text
-    async with asyncio.timeout(20):
-        while True:
-            response = await client.get(f"/v1/tasks/{task['task_id']}")
-            assert response.status_code == 200, response.text
-            result = response.json()
-            if result["status"] in TERMINAL_TASK_STATUSES:
-                return result
-            await asyncio.sleep(0.01)
+    result: dict[str, Any] | None = None
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            while True:
+                response = await client.get(f"/v1/tasks/{task['task_id']}")
+                assert response.status_code == 200, response.text
+                result = response.json()
+                if result["status"] in TERMINAL_TASK_STATUSES:
+                    return result
+                # 多层 ASGI 请求共享事件循环，避免高频查询挤占上传和解析任务。
+                await asyncio.sleep(0.05)
+    except TimeoutError:
+        pytest.fail(f"Task did not finish within {timeout_seconds}s; last response: {result!r}")
 
 
 async def _archive(client: httpx.AsyncClient, item: dict[str, Any]) -> dict[str, bytes]:
@@ -302,6 +313,95 @@ def test_mixed_task_tiers_across_deployments(
                     for execution in service.state.execution_store._executions.values():
                         native = Path(execution.request.file_name).suffix in {".html", ".docx"}
                         assert execution.request.tier == ("flash" if native else expected)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("deployment", ["api", "router", "cascade"])
+def test_task_filename_rejection_precedes_resource_allocation(tmp_path: Path, deployment: str) -> None:
+    """上传和 URL 混合清单中的非法名称在所有部署上均不得分配资源或转发。"""
+    sentinel = tmp_path / "outside.csv"
+    sentinel.write_bytes(b"SERVER_SENTINEL")
+    invalid_names = [
+        "",
+        ".",
+        "..",
+        "a" * 1025,
+        "../outside.csv",
+        str(sentinel),
+        r"..\outside.csv",
+        r"C:\in\t.csv",
+        "C:t.csv",
+        r"\\server\share\t.csv",
+        "t.csv:stream",
+        "t\x00.csv",
+        "t\r\n.csv",
+        "t\x7f.csv",
+        "t\x85.csv",
+    ]
+
+    async def scenario() -> None:
+        """先提交一个合法条目再附加非法条目，验证整个清单原子拒绝。"""
+        async with _deployment(tmp_path, deployment, {"native": ("standard",)}) as (client, _app, apps, submissions):
+            for source in ({"bytes": 1}, {"url": "https://source.invalid/t.csv"}):
+                for name in invalid_names:
+                    response = await client.post(
+                        "/v1/tasks",
+                        json={"files": [{"file_name": "valid.csv", **source}, {"file_name": name, **source}]},
+                    )
+                    assert response.status_code == 400, response.text
+                    assert response.json()["error"]["code"] == "invalid_request"
+                    assert response.json()["error"]["param"] == "files.1.file_name"
+                    assert not submissions
+                    for service in apps:
+                        assert not service.state.task_store._records
+                        if hasattr(service.state, "file_store"):
+                            assert not service.state.file_store._allocated_file_ids
+                        else:
+                            assert not service.state.registry._allocated_file_ids
+            assert sentinel.read_bytes() == b"SERVER_SENTINEL"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("deployment", ["api", "router", "cascade"])
+def test_native_csv_filename_and_storage_boundary(tmp_path: Path, deployment: str) -> None:
+    """隐藏与中文 CSV 使用真实原生解析，源文件名不能替代上传内容或控制落盘位置。"""
+    sentinel = tmp_path / ".t.csv"
+    server_data = b"name,value\nSERVER_SENTINEL,999\n"
+    sentinel.write_bytes(server_data)
+    content = b"name,value\nUPLOADED_BYTES,42\n"
+
+    async def scenario() -> None:
+        """检查接单档位、各跳名称、真实下载产物与受管存储目录。"""
+        async with _deployment(tmp_path, deployment, {"native": ("standard",)}) as (client, app, apps, submissions):
+            inputs = [(name, content) for name in (".t.csv", "报告 2026.CSV", "report..csv", "%2e%2e%2ft.csv")]
+            response = await client.post("/v1/tasks", json=_request_body(inputs, {"tier": "advanced"}))
+            assert response.status_code == 202, response.text
+            task = response.json()
+            assert app.state.task_store._records[task["task_id"]].options.tier == "flash"
+            # 四个文件经过两层 Router、磁盘存储和真实导出；这里验证正确性，不设 20 秒性能门槛。
+            result = await _complete(client, task, inputs, timeout_seconds=60)
+            assert result["status"] == "completed", result
+            assert [item["file_name"] for item in result["files"]] == [name for name, _data in inputs]
+            for item in result["files"]:
+                assert item["parse"]["tier"] == "flash"
+                archive = await _archive(client, item)
+                assert b"UPLOADED_BYTES" in archive["markdown.md"]
+                assert b"SERVER_SENTINEL" not in archive["markdown.md"]
+                middle = json.loads(archive["middle_json.json"])
+                assert middle["extensions"]["mineru"]["tier"] == "flash"
+            assert all("tier" not in body for _host, body in submissions)
+            for service in apps:
+                if hasattr(service.state, "file_store"):
+                    store = service.state.file_store
+                    for record in store._files.values():
+                        assert record.sha256sum is not None
+                        assert store._blob_abs(record.sha256sum).resolve().is_relative_to(store._root.resolve())
+                else:
+                    store = service.state.source_store
+                    assert all(source.path.resolve().is_relative_to(store._root.resolve()) for source in store._files.values())
+            assert sentinel.read_bytes() == server_data
 
     asyncio.run(scenario())
 
